@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -97,8 +98,8 @@ def pontos_sem_caixa(pontos, caixas, fracao_cabeca=0.45):
     return livres
 
 
-class ContadorPublico:
-    def __init__(self, modelo="yolo26m.pt", conf=0.25, iou=0.5, tamanho_bloco=640, sobreposicao=0.25, imgsz=640, lote=16, cadeiras=True, densidade=True, limiar_cabeca=0.5, escala_cabeca=1.0):
+class DetectorBlocos:
+    def __init__(self, modelo, conf=0.25, iou=0.5, tamanho_bloco=320, sobreposicao=0.3, imgsz=640, lote=16, classes=None):
         self.model = YOLO(modelo)
         self.conf = conf
         self.iou = iou
@@ -106,15 +107,7 @@ class ContadorPublico:
         self.sobreposicao = sobreposicao
         self.imgsz = imgsz
         self.lote = lote
-        self.coco = self.model.names.get(PESSOA) == "person"
-        if self.coco:
-            self.classes = [PESSOA, CADEIRA] if cadeiras else [PESSOA]
-        else:
-            self.classes = None
-        self.densidade = None
-        if densidade:
-            from p2pnet import ContadorDensidade
-            self.densidade = ContadorDensidade(limiar=limiar_cabeca, escala=escala_cabeca)
+        self.classes = classes
 
     def _prever(self, imagens):
         saida = []
@@ -122,7 +115,7 @@ class ContadorPublico:
             saida.extend(self.model(imagens[i:i + self.lote], conf=self.conf, iou=self.iou, imgsz=self.imgsz, classes=self.classes, max_det=1000, verbose=False))
         return saida
 
-    def detectar(self, imagem, regiao=None):
+    def detectar(self, imagem):
         altura, largura = imagem.shape[:2]
         recortes = [(0, 0, largura, altura)]
         if self.tamanho_bloco and max(altura, largura) > self.tamanho_bloco:
@@ -134,37 +127,98 @@ class ContadorPublico:
                 continue
             caixas.append(r.boxes.xyxy.cpu().numpy() + [x1, y1, x1, y1])
             confs.append(r.boxes.conf.cpu().numpy())
-            cls = r.boxes.cls.cpu().numpy().astype(int)
-            classes.append(cls if self.coco else np.full_like(cls, PESSOA))
+            classes.append(r.boxes.cls.cpu().numpy().astype(int))
 
         caixas = np.concatenate(caixas) if caixas else np.zeros((0, 4))
         confs = np.concatenate(confs) if confs else np.zeros(0)
         classes = np.concatenate(classes) if classes else np.zeros(0, dtype=int)
 
         separados = {}
-        for classe in (PESSOA, CADEIRA):
+        for classe in np.unique(classes):
             m = classes == classe
             c, s = caixas[m], confs[m]
-            if len(c):
-                manter = nms(torch.from_numpy(c).float(), torch.from_numpy(s).float(), self.iou).numpy()
-                c, s = c[manter], s[manter]
-                manter = ~contido_em_outro(c, s)
-                c, s = c[manter], s[manter]
-            if regiao is not None and len(c):
-                c, s = filtrar_regiao(c, s, regiao)
-            separados[classe] = (c, s)
+            manter = nms(torch.from_numpy(c).float(), torch.from_numpy(s).float(), self.iou).numpy()
+            c, s = c[manter], s[manter]
+            manter = ~contido_em_outro(c, s)
+            separados[int(classe)] = (c[manter], s[manter])
+        return separados
 
-        pessoas, confs_pessoas = separados[PESSOA]
+
+class CabecasYOLO:
+    def __init__(self, modelo, conf=0.25, tamanho_bloco=320, sobreposicao=0.3, imgsz=800):
+        self.detector = DetectorBlocos(modelo, conf=conf, iou=0.4, tamanho_bloco=tamanho_bloco, sobreposicao=sobreposicao, imgsz=imgsz)
+
+    def caixas(self, imagem):
+        return self.detector.detectar(imagem).get(0, (np.zeros((0, 4)), np.zeros(0)))
+
+    def pontos(self, imagem):
+        caixas, confs = self.caixas(imagem)
+        return centros_caixas(caixas), confs
+
+
+class CabecasCombinadas:
+    def __init__(self, detector, densidade, margem=0.25):
+        self.detector = detector
+        self.densidade = densidade
+        self.margem = margem
+
+    def pontos(self, imagem):
+        caixas, confs = self.detector.caixas(imagem)
+        pontos, confs_p2p = self.densidade.pontos(imagem)
+        if len(caixas) and len(pontos):
+            w = (caixas[:, 2] - caixas[:, 0]) * self.margem
+            h = (caixas[:, 3] - caixas[:, 1]) * self.margem
+            dentro_x = (pontos[:, None, 0] >= caixas[None, :, 0] - w) & (pontos[:, None, 0] <= caixas[None, :, 2] + w)
+            dentro_y = (pontos[:, None, 1] >= caixas[None, :, 1] - h) & (pontos[:, None, 1] <= caixas[None, :, 3] + h)
+            novos = ~(dentro_x & dentro_y).any(axis=1)
+            pontos, confs_p2p = pontos[novos], confs_p2p[novos]
+        return np.concatenate([centros_caixas(caixas), pontos.reshape(-1, 2)]), np.concatenate([confs, confs_p2p])
+
+
+def centros_caixas(caixas):
+    if len(caixas) == 0:
+        return np.zeros((0, 2))
+    return np.column_stack([(caixas[:, 0] + caixas[:, 2]) / 2, (caixas[:, 1] + caixas[:, 3]) / 2])
+
+
+def criar_fonte_cabecas(cabecas, limiar=None, escala=1.0, modelo_cabecas=None):
+    if not cabecas or cabecas == "nenhuma":
+        return None
+    if cabecas in ("p2pnet", "combinado"):
+        from p2pnet import ContadorDensidade
+        densidade = ContadorDensidade(limiar=limiar or 0.5, escala=escala)
+        if cabecas == "p2pnet":
+            return densidade
+        return CabecasCombinadas(CabecasYOLO(modelo_cabecas), densidade)
+    return CabecasYOLO(cabecas, conf=limiar or 0.25)
+
+
+class ContadorPublico:
+    def __init__(self, modelo="yolo26m.pt", conf=0.25, iou=0.5, tamanho_bloco=320, sobreposicao=0.3, imgsz=640, lote=16, cadeiras=True, cabecas="p2pnet", limiar_cabeca=None, escala_cabeca=1.0, modelo_cabecas="runs/cabecas/weights/best.pt"):
+        self.detector = DetectorBlocos(modelo, conf, iou, tamanho_bloco, sobreposicao, imgsz, lote, [PESSOA, CADEIRA] if cadeiras else [PESSOA]) if modelo else None
+        self.cabecas = criar_fonte_cabecas(cabecas, limiar_cabeca, escala_cabeca, modelo_cabecas)
+
+    def detectar(self, imagem, regiao=None):
+        vazio = (np.zeros((0, 4)), np.zeros(0))
+        separados = self.detector.detectar(imagem) if self.detector else {}
+        pessoas, confs_pessoas = separados.get(PESSOA, vazio)
+        cadeiras, _ = separados.get(CADEIRA, vazio)
+        if regiao is not None:
+            pessoas, confs_pessoas = filtrar_regiao(pessoas, confs_pessoas, regiao)
+            cadeiras, _ = filtrar_regiao(cadeiras, np.zeros(len(cadeiras)), regiao)
+
         cabecas = np.zeros((0, 2))
-        if self.densidade is not None:
-            cabecas, _ = self.densidade.pontos(imagem)
+        if self.cabecas is not None:
+            cabecas, _ = self.cabecas.pontos(imagem)
             if regiao is not None and len(cabecas):
                 cabecas = cabecas[dentro_regiao(cabecas, regiao)]
             cabecas = cabecas[pontos_sem_caixa(cabecas, pessoas)]
-        return Resultado(pessoas, confs_pessoas, separados[CADEIRA][0], cabecas)
+        return Resultado(pessoas, confs_pessoas, cadeiras, cabecas)
 
 
 def dentro_regiao(pontos, regiao):
+    if len(pontos) == 0:
+        return np.zeros(0, dtype=bool)
     poligono = np.asarray(regiao, dtype=np.float32)
     return np.array([cv2.pointPolygonTest(poligono, (float(x), float(y)), False) >= 0 for x, y in pontos], dtype=bool)
 
@@ -228,6 +282,43 @@ def desenhar(imagem, resultado, regiao=None, calor=False, mostrar_cadeiras=True)
     for i, texto in enumerate(linhas):
         cv2.putText(saida, texto, (int(10 * escala), altura_linha * (i + 1)), cv2.FONT_HERSHEY_SIMPLEX, tamanho_fonte, (255, 255, 255), espessura, cv2.LINE_AA)
     return saida
+
+
+MODELO_TREINADO = Path("runs/cabecas/weights/best.pt")
+MODOS = ["combinado", "treinado", "p2pnet", "pessoas"]
+PRECISA_TREINO = {"combinado", "treinado"}
+
+
+def modo_padrao():
+    return "combinado" if MODELO_TREINADO.exists() else "p2pnet"
+
+
+def modos_disponiveis(modelo_cabecas):
+    return [m for m in MODOS if m not in PRECISA_TREINO or Path(modelo_cabecas).exists()]
+
+
+def adicionar_argumentos(parser):
+    parser.add_argument("--modo", choices=MODOS, default=modo_padrao(), help="combinado: pessoas + cabeças treinadas + P2PNet; treinado: pessoas + cabeças treinadas; p2pnet: pessoas + P2PNet; pessoas: só YOLO de pessoas")
+    parser.add_argument("--modelo", default="yolo26m.pt", help="YOLO COCO usado para pessoas e cadeiras")
+    parser.add_argument("--modelo-cabecas", default=str(MODELO_TREINADO))
+    parser.add_argument("--conf", type=float, default=0.25)
+    parser.add_argument("--bloco", type=int, default=320, help="tamanho do bloco em pixels; 0 desativa")
+    parser.add_argument("--sobreposicao", type=float, default=0.3)
+    parser.add_argument("--imgsz", type=int, default=640)
+    parser.add_argument("--limiar-cabeca", type=float, help="confiança mínima das cabeças (padrão 0.5 no p2pnet, 0.25 no treinado)")
+    parser.add_argument("--escala-cabeca", type=float, default=1.0, help="amplia a imagem antes do P2PNet")
+    parser.add_argument("--regiao", help="polígono x1,y1,x2,y2,x3,y3,... para contar só dentro dele")
+    parser.add_argument("--calor", action="store_true", help="desenha mapa de calor da densidade")
+    parser.add_argument("--sem-cadeiras", action="store_true")
+    parser.add_argument("--saida", default="saida")
+
+
+def criar_contador(args, modo=None):
+    modo = modo or args.modo
+    cabecas = {"combinado": "combinado", "treinado": args.modelo_cabecas, "p2pnet": "p2pnet", "pessoas": None}[modo]
+    if modo in PRECISA_TREINO and not Path(args.modelo_cabecas).exists():
+        raise SystemExit(f"Modelo de cabeças {args.modelo_cabecas} não encontrado. Rode 02_treinar_cabecas.py ou use --modo p2pnet.")
+    return ContadorPublico(args.modelo, conf=args.conf, tamanho_bloco=args.bloco, sobreposicao=args.sobreposicao, imgsz=args.imgsz, cadeiras=not args.sem_cadeiras, cabecas=cabecas, limiar_cabeca=args.limiar_cabeca, escala_cabeca=args.escala_cabeca, modelo_cabecas=args.modelo_cabecas)
 
 
 def ler_regiao(texto):
