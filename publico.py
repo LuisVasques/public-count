@@ -15,26 +15,39 @@ class Resultado:
     pessoas: np.ndarray
     confs: np.ndarray
     cadeiras: np.ndarray = field(default_factory=lambda: np.zeros((0, 4)))
+    cabecas: np.ndarray = field(default_factory=lambda: np.zeros((0, 2)))
 
     @property
     def total(self):
-        return len(self.pessoas)
+        return len(self.pessoas) + len(self.cabecas)
+
+    @property
+    def centros(self):
+        caixas = np.column_stack([(self.pessoas[:, 0] + self.pessoas[:, 2]) / 2, (self.pessoas[:, 1] + self.pessoas[:, 3]) / 2]) if len(self.pessoas) else np.zeros((0, 2))
+        return np.concatenate([caixas, self.cabecas.reshape(-1, 2)])
 
     @property
     def cadeiras_livres(self):
-        if len(self.cadeiras) == 0:
+        if len(self.cadeiras) == 0 or self.total == 0:
             return self.cadeiras
-        if len(self.pessoas) == 0:
-            return self.cadeiras
-        return self.cadeiras[~ocupadas(self.cadeiras, self.pessoas)]
+        return self.cadeiras[~ocupadas(self.cadeiras, self.pessoas, self.cabecas)]
 
 
-def ocupadas(cadeiras, pessoas):
-    cx = (cadeiras[:, 0] + cadeiras[:, 2]) / 2
-    cy = (cadeiras[:, 1] + cadeiras[:, 3]) / 2
-    dentro_x = (cx[:, None] >= pessoas[None, :, 0]) & (cx[:, None] <= pessoas[None, :, 2])
-    dentro_y = (cy[:, None] >= pessoas[None, :, 1]) & (cy[:, None] <= pessoas[None, :, 3])
-    return (dentro_x & dentro_y).any(axis=1)
+def ocupadas(cadeiras, pessoas, cabecas):
+    resultado = np.zeros(len(cadeiras), dtype=bool)
+    if len(pessoas):
+        cx = (cadeiras[:, 0] + cadeiras[:, 2]) / 2
+        cy = (cadeiras[:, 1] + cadeiras[:, 3]) / 2
+        dentro_x = (cx[:, None] >= pessoas[None, :, 0]) & (cx[:, None] <= pessoas[None, :, 2])
+        dentro_y = (cy[:, None] >= pessoas[None, :, 1]) & (cy[:, None] <= pessoas[None, :, 3])
+        resultado |= (dentro_x & dentro_y).any(axis=1)
+    if len(cabecas):
+        altura = cadeiras[:, 3] - cadeiras[:, 1]
+        topo = cadeiras[:, 1] - altura
+        dentro_x = (cabecas[None, :, 0] >= cadeiras[:, None, 0]) & (cabecas[None, :, 0] <= cadeiras[:, None, 2])
+        dentro_y = (cabecas[None, :, 1] >= topo[:, None]) & (cabecas[None, :, 1] <= cadeiras[:, None, 3])
+        resultado |= (dentro_x & dentro_y).any(axis=1)
+    return resultado
 
 
 def blocos(largura, altura, tamanho, sobreposicao):
@@ -66,8 +79,26 @@ def contido_em_outro(caixas, confs, limite=0.8):
     return ((fracao > limite) & mesmo_tamanho & pior).any(axis=1)
 
 
+def pontos_sem_caixa(pontos, caixas, fracao_cabeca=0.45):
+    if len(pontos) == 0 or len(caixas) == 0:
+        return np.ones(len(pontos), dtype=bool)
+    livres = np.ones(len(pontos), dtype=bool)
+    largura = caixas[:, 2] - caixas[:, 0]
+    altura = caixas[:, 3] - caixas[:, 1]
+    alvo_x = (caixas[:, 0] + caixas[:, 2]) / 2
+    alvo_y = caixas[:, 1] + 0.12 * altura
+    for i in np.argsort(-(largura * altura)):
+        x1, y1, x2, _ = caixas[i]
+        dentro = livres & (pontos[:, 0] >= x1) & (pontos[:, 0] <= x2) & (pontos[:, 1] >= y1) & (pontos[:, 1] <= y1 + fracao_cabeca * altura[i])
+        if dentro.any():
+            candidatos = np.flatnonzero(dentro)
+            distancia = np.hypot(pontos[candidatos, 0] - alvo_x[i], pontos[candidatos, 1] - alvo_y[i])
+            livres[candidatos[np.argmin(distancia)]] = False
+    return livres
+
+
 class ContadorPublico:
-    def __init__(self, modelo="yolo26m.pt", conf=0.25, iou=0.5, tamanho_bloco=640, sobreposicao=0.25, imgsz=640, lote=16, cadeiras=True):
+    def __init__(self, modelo="yolo26m.pt", conf=0.25, iou=0.5, tamanho_bloco=640, sobreposicao=0.25, imgsz=640, lote=16, cadeiras=True, densidade=True, limiar_cabeca=0.5, escala_cabeca=1.0):
         self.model = YOLO(modelo)
         self.conf = conf
         self.iou = iou
@@ -80,6 +111,10 @@ class ContadorPublico:
             self.classes = [PESSOA, CADEIRA] if cadeiras else [PESSOA]
         else:
             self.classes = None
+        self.densidade = None
+        if densidade:
+            from p2pnet import ContadorDensidade
+            self.densidade = ContadorDensidade(limiar=limiar_cabeca, escala=escala_cabeca)
 
     def _prever(self, imagens):
         saida = []
@@ -102,12 +137,9 @@ class ContadorPublico:
             cls = r.boxes.cls.cpu().numpy().astype(int)
             classes.append(cls if self.coco else np.full_like(cls, PESSOA))
 
-        if not caixas:
-            return Resultado(np.zeros((0, 4)), np.zeros(0))
-
-        caixas = np.concatenate(caixas)
-        confs = np.concatenate(confs)
-        classes = np.concatenate(classes)
+        caixas = np.concatenate(caixas) if caixas else np.zeros((0, 4))
+        confs = np.concatenate(confs) if confs else np.zeros(0)
+        classes = np.concatenate(classes) if classes else np.zeros(0, dtype=int)
 
         separados = {}
         for classe in (PESSOA, CADEIRA):
@@ -123,22 +155,31 @@ class ContadorPublico:
             separados[classe] = (c, s)
 
         pessoas, confs_pessoas = separados[PESSOA]
-        return Resultado(pessoas, confs_pessoas, separados[CADEIRA][0])
+        cabecas = np.zeros((0, 2))
+        if self.densidade is not None:
+            cabecas, _ = self.densidade.pontos(imagem)
+            if regiao is not None and len(cabecas):
+                cabecas = cabecas[dentro_regiao(cabecas, regiao)]
+            cabecas = cabecas[pontos_sem_caixa(cabecas, pessoas)]
+        return Resultado(pessoas, confs_pessoas, separados[CADEIRA][0], cabecas)
+
+
+def dentro_regiao(pontos, regiao):
+    poligono = np.asarray(regiao, dtype=np.float32)
+    return np.array([cv2.pointPolygonTest(poligono, (float(x), float(y)), False) >= 0 for x, y in pontos], dtype=bool)
 
 
 def filtrar_regiao(caixas, confs, regiao):
-    poligono = np.asarray(regiao, dtype=np.float32)
-    cx = (caixas[:, 0] + caixas[:, 2]) / 2
-    cy = (caixas[:, 1] + caixas[:, 3]) / 2
-    dentro = np.array([cv2.pointPolygonTest(poligono, (float(x), float(y)), False) >= 0 for x, y in zip(cx, cy)], dtype=bool)
+    centros = np.column_stack([(caixas[:, 0] + caixas[:, 2]) / 2, (caixas[:, 1] + caixas[:, 3]) / 2])
+    dentro = dentro_regiao(centros, regiao)
     return caixas[dentro], confs[dentro]
 
 
-def mapa_calor(forma, caixas, sigma=None):
+def mapa_calor(forma, centros, raio, sigma=None):
     altura, largura = forma[:2]
     mapa = np.zeros((altura, largura), dtype=np.float32)
-    for x1, y1, x2, y2 in caixas.astype(int):
-        cv2.circle(mapa, ((x1 + x2) // 2, (y1 + y2) // 2), max(2, (x2 - x1) // 3), 1.0, -1)
+    for x, y in centros.astype(int):
+        cv2.circle(mapa, (x, y), raio, 1.0, -1)
     sigma = sigma or max(largura, altura) / 60
     mapa = cv2.GaussianBlur(mapa, (0, 0), sigma)
     if mapa.max() > 0:
@@ -152,7 +193,7 @@ def desenhar(imagem, resultado, regiao=None, calor=False, mostrar_cadeiras=True)
     escala = max(1.0, max(altura, largura) / 1280)
 
     if calor and resultado.total:
-        mapa = mapa_calor(saida.shape, resultado.pessoas)
+        mapa = mapa_calor(saida.shape, resultado.centros, max(4, int(max(altura, largura) / 100)))
         colorido = cv2.applyColorMap((mapa * 255).astype(np.uint8), cv2.COLORMAP_JET)
         alfa = (mapa[..., None] * 0.6).clip(0, 0.6)
         saida = (saida * (1 - alfa) + colorido * alfa).astype(np.uint8)
@@ -165,10 +206,13 @@ def desenhar(imagem, resultado, regiao=None, calor=False, mostrar_cadeiras=True)
         cv2.rectangle(saida, (x1, y1), (x2, y2), (0, 165, 255), max(1, int(escala)))
 
     for x1, y1, x2, y2 in resultado.pessoas.astype(int):
-        centro = ((x1 + x2) // 2, (y1 + y2) // 2)
         if not calor:
             cv2.rectangle(saida, (x1, y1), (x2, y2), (0, 255, 0), max(1, int(escala)))
-        cv2.circle(saida, centro, max(2, int(3 * escala)), (0, 0, 255), -1, cv2.LINE_AA)
+        cv2.circle(saida, ((x1 + x2) // 2, (y1 + y2) // 2), max(2, int(3 * escala)), (0, 0, 255), -1, cv2.LINE_AA)
+
+    for x, y in resultado.cabecas.astype(int):
+        cv2.circle(saida, (x, y), max(3, int(4 * escala)), (255, 0, 255), -1, cv2.LINE_AA)
+        cv2.circle(saida, (x, y), max(3, int(4 * escala)), (255, 255, 255), 1, cv2.LINE_AA)
 
     linhas = [f"Pessoas: {resultado.total}"]
     if mostrar_cadeiras and len(resultado.cadeiras):

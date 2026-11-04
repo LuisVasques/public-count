@@ -3,6 +3,8 @@
 Identifica e conta as pessoas de um auditório a partir de uma **foto**, **vídeo** ou **câmera ao vivo**,
 de qualquer ângulo (de cima, de frente, de trás). Também estima **cadeiras livres** e **ocupação**.
 
+![exemplo](docs/exemplo.jpg)
+
 ## Preparar o ambiente
 
 Usa [uv](https://docs.astral.sh/uv/):
@@ -11,7 +13,8 @@ Usa [uv](https://docs.astral.sh/uv/):
 uv sync
 ```
 
-Na primeira execução o modelo `yolo26m.pt` é baixado automaticamente.
+Na primeira execução são baixados automaticamente o `yolo26m.pt` (Ultralytics) e os pesos do
+[P2PNet](https://github.com/TencentYoutuResearch/CrowdCounting-P2PNet) treinados no ShanghaiTech A (`modelos/p2pnet_shtech_a.pth`, ~86 MB).
 
 ## Uso
 
@@ -19,7 +22,8 @@ Na primeira execução o modelo `yolo26m.pt` é baixado automaticamente.
 |---|---|
 | `contar_foto.py` | Conta o público em uma ou várias fotos (ou pastas) e salva as imagens anotadas em `saida/` com um `resumo.json`. |
 | `contar_camera.py` | Conta ao vivo em webcam, arquivo de vídeo ou stream RTSP, com média móvel da contagem. |
-| `publico.py` | Biblioteca: detecção em blocos, junção das caixas, região de interesse, mapa de calor e desenho. |
+| `publico.py` | Biblioteca: YOLO em blocos, junção com o P2PNet, região de interesse, mapa de calor e desenho. |
+| `p2pnet.py` | Reimplementação do P2PNet (contagem de multidão por pontos) para carregar os pesos oficiais. |
 
 ```bash
 uv run contar_foto.py exemplos
@@ -31,34 +35,53 @@ uv run contar_camera.py --fonte rtsp://usuario:senha@ip:554/stream --intervalo 2
 
 Na câmera: `q`/`ESC` sai, `c` liga/desliga o mapa de calor, `s` salva o quadro anotado.
 
+Na imagem anotada: caixa verde com ponto vermelho é pessoa achada pelo YOLO, ponto rosa é cabeça achada pelo P2PNet,
+caixa laranja é cadeira livre.
+
 ### Parâmetros principais
 
 | Parâmetro | Padrão | Efeito |
 |---|---|---|
-| `--modelo` | `yolo26m.pt` | `n`/`s` mais rápido, `l`/`x` mais preciso. Aceita também um detector de cabeças próprio. |
-| `--bloco` | `256` | Tamanho dos blocos em que a imagem é dividida. Menor acha pessoas menores e distantes, mas é mais lento. `0` desativa. |
+| `--modelo` | `yolo26m.pt` | `n`/`s` mais rápido, `l`/`x` mais preciso. |
+| `--bloco` | `320` | Tamanho dos blocos em que a imagem é dividida para o YOLO. `0` desativa. |
 | `--sobreposicao` | `0.3` | Quanto os blocos se sobrepõem, para não perder quem está na borda. |
-| `--conf` | `0.15` | Confiança mínima. Público denso pede valores baixos. |
-| `--regiao` | | Polígono em pixels; só conta quem tem o centro dentro dele (ex.: só a plateia, sem o palco). |
+| `--conf` | `0.25` | Confiança mínima do YOLO. |
+| `--limiar-cabeca` | `0.5` | Confiança mínima dos pontos do P2PNet. Suba se aparecerem cabeças falsas em paredes e cortinas. |
+| `--escala-cabeca` | `1.0` | Amplia a imagem antes do P2PNet; ajuda quando as cabeças são minúsculas. |
+| `--sem-densidade` | | Usa só o YOLO. |
+| `--regiao` | | Polígono em pixels; só conta quem está dentro dele (ex.: só a plateia, sem o palco). |
 | `--calor` | | Mapa de calor da densidade de pessoas. |
 
 ## Como funciona
 
-1. **Inferência em blocos (tiling)**: numa foto de auditório cada pessoa ocupa poucos pixels. Redimensionar a foto
-   inteira para 640 px faz o modelo perder a maioria. A imagem é cortada em blocos sobrepostos, cada bloco passa pelo
-   YOLO na resolução cheia e as caixas voltam para as coordenadas da foto original.
-2. **Junção das caixas**: a mesma pessoa aparece em mais de um bloco. Um NMS remove as caixas repetidas e um segundo
-   filtro remove caixas parciais (pessoa cortada na borda de um bloco) contidas numa caixa maior da mesma pessoa.
-3. **Cadeiras e ocupação**: o modelo COCO também detecta `chair`. Cadeira cujo centro não está dentro de nenhuma
-   pessoa é considerada livre; ocupação = pessoas / (pessoas + cadeiras livres).
+A contagem é **híbrida**, porque nenhum modelo sozinho funciona bem em todas as vistas:
+
+1. **YOLO em blocos (tiling)**: a imagem é cortada em blocos sobrepostos e cada bloco passa pelo YOLO na resolução
+   cheia. Um NMS junta as caixas repetidas entre blocos e um segundo filtro remove pedaços de pessoas cortadas na
+   borda. É bom para pessoas **grandes e próximas** da câmera.
+2. **P2PNet**: rede de contagem de multidões que, em vez de caixas, prevê **um ponto por cabeça**. Treinada em
+   multidões densas, acha cabeças pequenas, de costas e muito sobrepostas, onde o YOLO falha.
+3. **Junção**: cada caixa do YOLO "consome" no máximo um ponto do P2PNet na região da cabeça (o mais próximo do topo
+   da caixa). O total é caixas + pontos que sobraram. Assim a mesma pessoa não é contada duas vezes e as pessoas de
+   trás que aparecem dentro da caixa de quem está na frente continuam contando.
+4. **Cadeiras e ocupação**: o YOLO também detecta `chair`. Cadeira sem pessoa nem cabeça sobre ela é considerada
+   livre; ocupação = pessoas / (pessoas + cadeiras livres).
+
+Nas fotos de `exemplos/`:
+
+| Foto | Só YOLO | Híbrido |
+|---|---|---|
+| `auditorio_1.jpg` (de cima, muito denso) | 92 | 298 |
+| `auditorio_2.jpg` (de frente) | 53 | 163 |
+| `auditorio_3.jpg` (de trás) | 69 | 97 |
+| `auditorio_4.jpg` (de trás, perto) | 13 | 22 |
+
+Numa RTX 3050 o híbrido leva ~0,4 s por quadro de 1280×960.
 
 ## Limitações e próximos passos
 
-O detector COCO de pessoas tem boa precisão, mas em público muito denso (fotos de cima ou de trás, onde só se vê
-a cabeça) ele **conta para baixo**: pessoas muito sobrepostas não são separadas. Caminhos para melhorar:
-
-- **Detector de cabeças**: treinar (ou usar) um YOLO de uma classe `head` em datasets como CrowdHuman ou SCUT-HEAD.
-  Basta passar o `.pt` em `--modelo`; os scripts tratam qualquer modelo sem a classe `person` como detector de cabeças.
-- **Contagem por mapa de densidade** (CSRNet, DM-Count, P2PNet): em vez de caixas, estima a densidade; é o estado da
-  arte para multidões com centenas de pessoas.
-- Exportar para TensorRT (`model.export(format="engine")`) para acelerar a câmera ao vivo.
+- Cabeças **muito grandes** em primeiro plano, cortadas pela borda da foto, às vezes não são contadas por nenhum dos dois.
+- Superfícies com textura parecida com cabeças (cortinas, plateias desenhadas) podem gerar pontos falsos; use
+  `--regiao` ou suba `--limiar-cabeca`.
+- Fine-tuning do P2PNet ou de um detector de cabeças com fotos do próprio auditório deve melhorar bastante.
+- Exportar para TensorRT para acelerar a câmera ao vivo.
