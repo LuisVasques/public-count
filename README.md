@@ -24,6 +24,7 @@ Na primeira execução são baixados automaticamente o `yolo26m.pt` (Ultralytics
 | `02_train_heads.py` | Baixa o CrowdHuman, converte as caixas de cabeça para o formato YOLO e treina um YOLO26s detector de cabeças. |
 | `03_count_photo.py` | Conta o público em fotos ou pastas, salva as imagens anotadas e um `summary.json` em `output/`. |
 | `04_count_webcam.py` | Conta ao vivo em webcam, arquivo de vídeo ou stream RTSP, com média móvel e troca de modo pelo teclado. |
+| `05_find_camera.py` | Procura câmeras na rede local e testa se aceitam ONVIF ou RTSP. |
 | `audience.py` | Biblioteca: YOLO em blocos, fontes de cabeças, junção, região de interesse, mapa de calor e desenho. |
 | `p2pnet.py` | Reimplementação do P2PNet (contagem de multidão por pontos) para carregar os pesos oficiais. |
 
@@ -69,6 +70,38 @@ caixa laranja é cadeira livre.
 | `--region` | | Polígono em pixels; só conta quem está dentro dele (ex.: só a plateia, sem o palco). |
 | `--heatmap` | | Mapa de calor da densidade de pessoas. |
 
+## Câmera de rede
+
+O `04_count_webcam.py` aceita qualquer URL de vídeo. Em câmeras de rede ele lê sempre o quadro mais recente, para a
+imagem não atrasar enquanto o modelo processa, e reconecta sozinho se o stream cair.
+
+```bash
+uv run 05_find_camera.py
+uv run 05_find_camera.py --ip 192.168.1.50 --user admin --password senha
+uv run 04_count_webcam.py --source 'rtsp://admin:senha@192.168.1.50:554/stream1'
+```
+
+A câmera precisa liberar RTSP. Câmeras que só funcionam pelo aplicativo do fabricante não entregam vídeo direto na
+rede local.
+
+### Câmeras Tuya / Smart Life
+
+Testado com a WAP LENS 100. Ative o ONVIF nas configurações da câmera no Smart Life e crie uma senha. O usuário é `admin`,
+e a URL usa um hash em vez de usuário e senha:
+
+```
+rtsp://IP:5543/<md5 de usuário + senha>/live/channel0
+```
+
+O `05_find_camera.py` monta essa URL, testa e salva em `.camera_url`, que só o seu usuário lê e que não vai para o Git,
+porque o hash funciona como senha. A senha é lida da variável `CAMERA_PASSWORD`:
+
+```bash
+read -s "CAMERA_PASSWORD?Senha: " && export CAMERA_PASSWORD
+uv run 05_find_camera.py --ip 192.168.1.14 --user admin
+uv run 04_count_webcam.py --source camera
+```
+
 ## Treino do detector de cabeças
 
 O `02_train_heads.py` usa o [CrowdHuman](https://www.crowdhuman.org/) (espelho no
@@ -112,10 +145,10 @@ Nas fotos de `examples/` (`uv run 03_count_photo.py examples --compare`):
 
 | Foto | people | p2pnet | trained | combined |
 |---|---|---|---|---|
-| `auditorium_1.jpg` (de cima, muito denso) | 92 | 298 | 261 | 341 |
-| `auditorium_2.jpg` (de frente) | 53 | 163 | 124 | 164 |
-| `auditorium_3.jpg` (de trás) | 69 | 97 | 102 | 102 |
-| `auditorium_4.jpg` (de trás, perto) | 13 | 22 | 17 | 18 |
+| `auditorium_1.jpg` (de cima, muito denso) | 92 | 298 | 260 | 340 |
+| `auditorium_2.jpg` (de frente) | 34 | 156 | 117 | 158 |
+| `auditorium_3.jpg` (de trás) | 66 | 95 | 96 | 96 |
+| `auditorium_4.jpg` (de trás, perto) | 13 | 22 | 16 | 17 |
 
 Na foto 4 o P2PNet conta alguns pontos falsos na cortina; o treinado e o combinado não.
 
@@ -124,5 +157,6 @@ Na foto 4 o P2PNet conta alguns pontos falsos na cortina; o treinado e o combina
 - As fotos de exemplo não têm contagem manual, então os números acima comparam os modos entre si, não com o valor real.
   Anotar algumas fotos do próprio auditório permitiria medir o erro de verdade.
 - Cabeças muito pequenas e escuras sobre fundo escuro ainda escapam.
+- O detector de cabeças pode marcar objetos parecidos com cabeça, como bonecos e bolsas. Use `--region` ou suba `--head-threshold`.
 - Fine-tuning do detector de cabeças com fotos do próprio auditório (vista de cima) deve melhorar bastante.
 - Exportar para TensorRT (`model.export(format="engine")`) para acelerar a webcam.

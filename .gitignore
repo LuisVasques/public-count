@@ -6,3 +6,4 @@ output/
 *.onnx
 *.engine
 models/
+.camera_url

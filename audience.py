@@ -64,7 +64,7 @@ def tiles(width, height, size, overlap):
     return [(x, y, min(x + size, width), min(y + size, height)) for y in starts(height) for x in starts(width)]
 
 
-def contained_in_another(boxes, confs, limit=0.8):
+def contained_in_another(boxes, confs, limit=0.8, any_size=False):
     if len(boxes) < 2:
         return np.zeros(len(boxes), dtype=bool)
     x1 = np.maximum(boxes[:, None, 0], boxes[None, :, 0])
@@ -75,9 +75,32 @@ def contained_in_another(boxes, confs, limit=0.8):
     area = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
     fraction = inter / np.maximum(area[:, None], 1e-6)
     np.fill_diagonal(fraction, 0)
+    if any_size:
+        return ((fraction > limit) & (area[:, None] <= area[None, :])).any(axis=1)
     same_size = area[None, :] <= 3 * area[:, None]
     worse = confs[:, None] <= confs[None, :]
     return ((fraction > limit) & same_size & worse).any(axis=1)
+
+
+def cut_by_tile(boxes, crop, width, height, margin=2, min_span=0.6):
+    x1, y1, x2, y2 = crop
+    left = (x1 > 0) & (boxes[:, 0] <= x1 + margin)
+    top = (y1 > 0) & (boxes[:, 1] <= y1 + margin)
+    right = (x2 < width) & (boxes[:, 2] >= x2 - margin)
+    bottom = (y2 < height) & (boxes[:, 3] >= y2 - margin)
+    wide = (boxes[:, 2] - boxes[:, 0]) >= min_span * (x2 - x1)
+    tall = (boxes[:, 3] - boxes[:, 1]) >= min_span * (y2 - y1)
+    return (left | right | top | bottom) & (wide | tall)
+
+
+def inside_large_box(boxes, from_full, tile, limit=0.8):
+    area = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+    large = boxes[from_full & (area >= tile * tile)]
+    if len(large) == 0:
+        return np.zeros(len(boxes), dtype=bool)
+    width = np.clip(np.minimum(boxes[:, None, 2], large[None, :, 2]) - np.maximum(boxes[:, None, 0], large[None, :, 0]), 0, None)
+    height = np.clip(np.minimum(boxes[:, None, 3], large[None, :, 3]) - np.maximum(boxes[:, None, 1], large[None, :, 1]), 0, None)
+    return ~from_full & ((width * height / np.maximum(area[:, None], 1e-6)) > limit).any(axis=1)
 
 
 def unmatched_points(points, boxes, head_fraction=0.45):
@@ -99,7 +122,7 @@ def unmatched_points(points, boxes, head_fraction=0.45):
 
 
 class TiledDetector:
-    def __init__(self, model, conf=0.25, iou=0.5, tile_size=320, overlap=0.3, imgsz=640, batch_size=16, classes=None):
+    def __init__(self, model, conf=0.25, iou=0.5, tile_size=320, overlap=0.3, imgsz=640, batch_size=16, classes=None, no_nesting=False):
         self.model = YOLO(model)
         self.conf = conf
         self.iou = iou
@@ -108,6 +131,7 @@ class TiledDetector:
         self.imgsz = imgsz
         self.batch_size = batch_size
         self.classes = classes
+        self.no_nesting = no_nesting
 
     def _predict(self, images):
         output = []
@@ -118,35 +142,40 @@ class TiledDetector:
     def detect(self, image):
         height, width = image.shape[:2]
         crops = [(0, 0, width, height)]
-        if self.tile_size and max(height, width) > self.tile_size:
-            crops += tiles(width, height, self.tile_size, self.overlap)
+        tile = max(self.tile_size, max(height, width) // 4) if self.tile_size else 0
+        if tile and max(height, width) > tile:
+            crops += tiles(width, height, tile, self.overlap)
 
-        boxes, confs, classes = [], [], []
-        for (x1, y1, x2, y2), r in zip(crops, self._predict([image[y1:y2, x1:x2] for x1, y1, x2, y2 in crops])):
+        boxes, confs, classes, from_full = [], [], [], []
+        for index, (crop, r) in enumerate(zip(crops, self._predict([image[y1:y2, x1:x2] for x1, y1, x2, y2 in crops]))):
             if len(r.boxes) == 0:
                 continue
-            boxes.append(r.boxes.xyxy.cpu().numpy() + [x1, y1, x1, y1])
-            confs.append(r.boxes.conf.cpu().numpy())
-            classes.append(r.boxes.cls.cpu().numpy().astype(int))
+            found = r.boxes.xyxy.cpu().numpy() + [crop[0], crop[1], crop[0], crop[1]]
+            keep = np.ones(len(found), dtype=bool) if index == 0 else ~cut_by_tile(found, crop, width, height)
+            boxes.append(found[keep])
+            confs.append(r.boxes.conf.cpu().numpy()[keep])
+            classes.append(r.boxes.cls.cpu().numpy().astype(int)[keep])
+            from_full.append(np.full(keep.sum(), index == 0))
 
         boxes = np.concatenate(boxes) if boxes else np.zeros((0, 4))
         confs = np.concatenate(confs) if confs else np.zeros(0)
         classes = np.concatenate(classes) if classes else np.zeros(0, dtype=int)
+        from_full = np.concatenate(from_full) if from_full else np.zeros(0, dtype=bool)
 
         by_class = {}
         for class_id in np.unique(classes):
             m = classes == class_id
-            c, s = boxes[m], confs[m]
+            c, s, f = boxes[m], confs[m], from_full[m]
             keep = nms(torch.from_numpy(c).float(), torch.from_numpy(s).float(), self.iou).numpy()
-            c, s = c[keep], s[keep]
-            keep = ~contained_in_another(c, s)
+            c, s, f = c[keep], s[keep], f[keep]
+            keep = ~contained_in_another(c, s, any_size=self.no_nesting) & ~inside_large_box(c, f, tile)
             by_class[int(class_id)] = (c[keep], s[keep])
         return by_class
 
 
 class YoloHeads:
     def __init__(self, model, conf=0.25, tile_size=320, overlap=0.3, imgsz=800):
-        self.detector = TiledDetector(model, conf=conf, iou=0.4, tile_size=tile_size, overlap=overlap, imgsz=imgsz)
+        self.detector = TiledDetector(model, conf=conf, iou=0.4, tile_size=tile_size, overlap=overlap, imgsz=imgsz, no_nesting=True)
 
     def boxes(self, image):
         return self.detector.detect(image).get(0, (np.zeros((0, 4)), np.zeros(0)))
