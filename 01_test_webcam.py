@@ -13,11 +13,11 @@ def main():
     if not cap.isOpened():
         raise SystemExit(f"Não consegui abrir a câmera {args.camera}. Tente outro --camera.")
 
-    largura = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    altura = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"Câmera {args.camera} aberta: {largura}x{altura}")
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"Câmera {args.camera} aberta: {width}x{height}")
 
-    anterior = time.perf_counter()
+    previous = time.perf_counter()
     while True:
         ok, frame = cap.read()
         if not ok:
@@ -26,9 +26,9 @@ def main():
 
         frame = cv2.flip(frame, 1)
 
-        agora = time.perf_counter()
-        fps = 1.0 / (agora - anterior)
-        anterior = agora
+        now = time.perf_counter()
+        fps = 1.0 / (now - previous)
+        previous = now
         cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
         cv2.imshow("Webcam", frame)

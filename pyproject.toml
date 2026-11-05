@@ -1,5 +1,5 @@
 [project]
-name = "contagem-publico"
+name = "public-count"
 version = "0.1.0"
 description = "Identificação e contagem de público em auditórios por foto, vídeo ou câmera com YOLO e inferência em blocos"
 authors = [

@@ -7,25 +7,25 @@ import torch
 from torch import nn
 from torchvision.models import vgg16_bn
 
-URL_PESOS = "https://github.com/TencentYoutuResearch/CrowdCounting-P2PNet/raw/main/weights/SHTechA.pth"
-MEDIA = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-DESVIO = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+WEIGHTS_URL = "https://github.com/TencentYoutuResearch/CrowdCounting-P2PNet/raw/main/weights/SHTechA.pth"
+MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
-def cabeca(entrada, saida, tamanho=256):
-    camadas = nn.Module()
-    camadas.conv1 = nn.Conv2d(entrada, tamanho, 3, padding=1)
-    camadas.conv2 = nn.Conv2d(tamanho, tamanho, 3, padding=1)
-    camadas.conv3 = nn.Conv2d(tamanho, tamanho, 3, padding=1)
-    camadas.conv4 = nn.Conv2d(tamanho, tamanho, 3, padding=1)
-    camadas.output = nn.Conv2d(tamanho, saida, 3, padding=1)
-    return camadas
+def head_block(in_channels, out_channels, size=256):
+    layers = nn.Module()
+    layers.conv1 = nn.Conv2d(in_channels, size, 3, padding=1)
+    layers.conv2 = nn.Conv2d(size, size, 3, padding=1)
+    layers.conv3 = nn.Conv2d(size, size, 3, padding=1)
+    layers.conv4 = nn.Conv2d(size, size, 3, padding=1)
+    layers.output = nn.Conv2d(size, out_channels, 3, padding=1)
+    return layers
 
 
-def aplicar_cabeca(camadas, x):
-    x = torch.relu(camadas.conv1(x))
-    x = torch.relu(camadas.conv2(x))
-    return camadas.output(x).permute(0, 2, 3, 1)
+def apply_head_block(layers, x):
+    x = torch.relu(layers.conv1(x))
+    x = torch.relu(layers.conv2(x))
+    return layers.output(x).permute(0, 2, 3, 1)
 
 
 class Backbone(nn.Module):
@@ -38,22 +38,22 @@ class Backbone(nn.Module):
         self.body4 = nn.Sequential(*f[33:43])
 
     def forward(self, x):
-        saidas = []
-        for corpo in (self.body1, self.body2, self.body3, self.body4):
-            x = corpo(x)
-            saidas.append(x)
-        return saidas
+        outputs = []
+        for stage in (self.body1, self.body2, self.body3, self.body4):
+            x = stage(x)
+            outputs.append(x)
+        return outputs
 
 
 class FPN(nn.Module):
-    def __init__(self, c3=256, c4=512, c5=512, tamanho=256):
+    def __init__(self, c3=256, c4=512, c5=512, size=256):
         super().__init__()
-        self.P5_1 = nn.Conv2d(c5, tamanho, 1)
-        self.P5_2 = nn.Conv2d(tamanho, tamanho, 3, padding=1)
-        self.P4_1 = nn.Conv2d(c4, tamanho, 1)
-        self.P4_2 = nn.Conv2d(tamanho, tamanho, 3, padding=1)
-        self.P3_1 = nn.Conv2d(c3, tamanho, 1)
-        self.P3_2 = nn.Conv2d(tamanho, tamanho, 3, padding=1)
+        self.P5_1 = nn.Conv2d(c5, size, 1)
+        self.P5_2 = nn.Conv2d(size, size, 3, padding=1)
+        self.P4_1 = nn.Conv2d(c4, size, 1)
+        self.P4_2 = nn.Conv2d(size, size, 3, padding=1)
+        self.P3_1 = nn.Conv2d(c3, size, 1)
+        self.P3_2 = nn.Conv2d(size, size, 3, padding=1)
 
     def forward(self, c3, c4, c5):
         p5 = self.P5_1(c5)
@@ -62,68 +62,68 @@ class FPN(nn.Module):
 
 
 class P2PNet(nn.Module):
-    def __init__(self, linhas=2, colunas=2):
+    def __init__(self, rows=2, columns=2):
         super().__init__()
-        self.ancoras_por_celula = linhas * colunas
-        self.linhas = linhas
-        self.colunas = colunas
+        self.anchors_per_cell = rows * columns
+        self.rows = rows
+        self.columns = columns
         self.backbone = Backbone()
         self.fpn = FPN()
-        self.regression = cabeca(256, self.ancoras_por_celula * 2)
-        self.classification = cabeca(256, self.ancoras_por_celula * 2)
+        self.regression = head_block(256, self.anchors_per_cell * 2)
+        self.classification = head_block(256, self.anchors_per_cell * 2)
 
-    def ancoras(self, altura, largura, passo, dispositivo):
-        dx = (torch.arange(1, self.colunas + 1, device=dispositivo) - 0.5) * passo / self.colunas - passo / 2
-        dy = (torch.arange(1, self.linhas + 1, device=dispositivo) - 0.5) * passo / self.linhas - passo / 2
+    def anchors(self, height, width, step, device):
+        dx = (torch.arange(1, self.columns + 1, device=device) - 0.5) * step / self.columns - step / 2
+        dy = (torch.arange(1, self.rows + 1, device=device) - 0.5) * step / self.rows - step / 2
         base = torch.stack(torch.meshgrid(dx, dy, indexing="xy"), -1).reshape(-1, 2)
-        cx = (torch.arange(largura, device=dispositivo) + 0.5) * passo
-        cy = (torch.arange(altura, device=dispositivo) + 0.5) * passo
-        centros = torch.stack(torch.meshgrid(cx, cy, indexing="xy"), -1).reshape(-1, 1, 2)
-        return (centros + base[None]).reshape(-1, 2)
+        cx = (torch.arange(width, device=device) + 0.5) * step
+        cy = (torch.arange(height, device=device) + 0.5) * step
+        centers = torch.stack(torch.meshgrid(cx, cy, indexing="xy"), -1).reshape(-1, 1, 2)
+        return (centers + base[None]).reshape(-1, 2)
 
     def forward(self, x):
         _, c3, c4, c5 = self.backbone(x)
         p4 = self.fpn(c3, c4, c5)
-        lote, _, altura, largura = p4.shape
-        deslocamento = aplicar_cabeca(self.regression, p4).reshape(lote, -1, 2) * 100
-        logits = aplicar_cabeca(self.classification, p4).reshape(lote, -1, 2)
-        pontos = deslocamento + self.ancoras(altura, largura, x.shape[2] // altura, x.device)
-        return pontos, logits.softmax(-1)[..., 1]
+        batch_size, _, height, width = p4.shape
+        offsets = apply_head_block(self.regression, p4).reshape(batch_size, -1, 2) * 100
+        logits = apply_head_block(self.classification, p4).reshape(batch_size, -1, 2)
+        points = offsets + self.anchors(height, width, x.shape[2] // height, x.device)
+        return points, logits.softmax(-1)[..., 1]
 
 
-def carregar(caminho="modelos/p2pnet_shtech_a.pth", dispositivo=None):
-    caminho = Path(caminho)
-    if not caminho.exists():
-        caminho.parent.mkdir(parents=True, exist_ok=True)
-        print(f"Baixando pesos do P2PNet para {caminho}...")
-        urlretrieve(URL_PESOS, caminho)
-    dispositivo = dispositivo or ("cuda" if torch.cuda.is_available() else "cpu")
-    estado = torch.load(caminho, map_location="cpu", weights_only=True)
-    modelo = P2PNet()
-    modelo.load_state_dict(estado.get("model", estado))
-    return modelo.eval().to(dispositivo)
+def load_model(path="models/p2pnet_shtech_a.pth", device=None):
+    path = Path(path)
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"Baixando pesos do P2PNet para {path}...")
+        urlretrieve(WEIGHTS_URL, path)
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    model = P2PNet()
+    model.load_state_dict(state.get("model", state))
+    return model.eval().to(device)
 
 
-class ContadorDensidade:
-    def __init__(self, pesos="modelos/p2pnet_shtech_a.pth", limiar=0.5, lado_max=2048, escala=1.0):
-        self.modelo = carregar(pesos)
-        self.dispositivo = next(self.modelo.parameters()).device
-        self.limiar = limiar
-        self.lado_max = lado_max
-        self.escala = escala
+class DensityCounter:
+    def __init__(self, weights="models/p2pnet_shtech_a.pth", threshold=0.5, max_side=2048, scale=1.0):
+        self.model = load_model(weights)
+        self.device = next(self.model.parameters()).device
+        self.threshold = threshold
+        self.max_side = max_side
+        self.scale = scale
 
     @torch.inference_mode()
-    def pontos(self, imagem):
-        altura, largura = imagem.shape[:2]
-        fator = min(self.escala, self.lado_max / max(altura, largura))
-        nova_l = max(128, round(largura * fator / 128) * 128)
-        nova_a = max(128, round(altura * fator / 128) * 128)
-        rgb = cv2.cvtColor(cv2.resize(imagem, (nova_l, nova_a), interpolation=cv2.INTER_AREA if fator < 1 else cv2.INTER_LINEAR), cv2.COLOR_BGR2RGB)
-        x = (rgb.astype(np.float32) / 255 - MEDIA) / DESVIO
-        x = torch.from_numpy(x).permute(2, 0, 1)[None].to(self.dispositivo)
-        pontos, confs = self.modelo(x)
-        manter = confs[0] > self.limiar
-        pontos = pontos[0][manter].cpu().numpy()
-        pontos[:, 0] *= largura / nova_l
-        pontos[:, 1] *= altura / nova_a
-        return pontos, confs[0][manter].cpu().numpy()
+    def points(self, image):
+        height, width = image.shape[:2]
+        factor = min(self.scale, self.max_side / max(height, width))
+        new_width = max(128, round(width * factor / 128) * 128)
+        new_height = max(128, round(height * factor / 128) * 128)
+        rgb = cv2.cvtColor(cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA if factor < 1 else cv2.INTER_LINEAR), cv2.COLOR_BGR2RGB)
+        x = (rgb.astype(np.float32) / 255 - MEAN) / STD
+        x = torch.from_numpy(x).permute(2, 0, 1)[None].to(self.device)
+        points, confs = self.model(x)
+        keep = confs[0] > self.threshold
+        points = points[0][keep].cpu().numpy()
+        points[:, 0] *= width / new_width
+        points[:, 1] *= height / new_height
+        return points, confs[0][keep].cpu().numpy()
